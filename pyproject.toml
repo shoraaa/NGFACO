@@ -6,9 +6,11 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "d2l>=0.17.0",
+    "ipython>=9.8.0",
     "ipywidgets>=8.1.8",
     "jupyter>=1.1.1",
     "numba>=0.63.1",
     "torch-geometric>=2.7.0",
     "tqdm>=4.67.1",
+    "wandb>=0.23.1",
 ]
