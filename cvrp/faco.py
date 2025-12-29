@@ -205,6 +205,7 @@ class FACO:
         min_new_edges: int = 8,
         sample_two_opt: bool = True,
         ls_max_iterations: int = 2000,
+        use_full_graph: bool = False,   # If True, use all edges (k = n-1) for ablation
         device: str = "cpu",
     ):
         self.device = device
@@ -219,7 +220,14 @@ class FACO:
         self.capacity = int(capacity)
 
         self.n_ants = int(n_ants)
-        self.k = min(int(k_nearest), self.n - 1)
+        self.use_full_graph = bool(use_full_graph)
+        
+        # In full graph mode, use all neighbors (k = n-1)
+        if self.use_full_graph:
+            self.k = self.n - 1
+        else:
+            self.k = min(int(k_nearest), self.n - 1)
+        
         self.decay = float(decay)
         self.alpha = float(alpha)
         self.beta = float(beta)

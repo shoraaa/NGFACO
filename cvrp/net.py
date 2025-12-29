@@ -126,9 +126,25 @@ class Net(nn.Module):
         if return_value:
             if not self.value_head:
                 raise ValueError("Net was created with value_head=False but return_value=True was requested.")
-            # simple global pooling over edges to get a single embedding, then value
-            emb_graph = emb.mean(dim=0, keepdim=True)   # (1, units)
-            val = self.par_net_val(emb_graph).squeeze(-1)  # (1,) -> scalar-ish
+            
+            # Per-graph pooling: handle both single graph and batched graphs
+            if hasattr(pyg, 'batch') and pyg.batch is not None:
+                # Batched mode: pool edges per graph using edge batch assignment
+                # Create edge-to-graph mapping from node batch
+                edge_batch = pyg.batch[edge_index[0]]  # (E,) graph index per edge
+                n_graphs = int(edge_batch.max().item()) + 1
+                
+                # Scatter mean pooling per graph
+                emb_sum = torch.zeros(n_graphs, emb.size(1), device=emb.device, dtype=emb.dtype)
+                edge_count = torch.zeros(n_graphs, device=emb.device, dtype=emb.dtype)
+                emb_sum.scatter_add_(0, edge_batch.unsqueeze(1).expand_as(emb), emb)
+                edge_count.scatter_add_(0, edge_batch, torch.ones(emb.size(0), device=emb.device, dtype=emb.dtype))
+                emb_graph = emb_sum / edge_count.unsqueeze(1).clamp_min(1)  # (n_graphs, units)
+            else:
+                # Single graph mode
+                emb_graph = emb.mean(dim=0, keepdim=True)   # (1, units)
+            
+            val = self.par_net_val(emb_graph).squeeze(-1)  # (n_graphs,) or scalar
             return heu, val
 
         return heu

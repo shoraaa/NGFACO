@@ -21,13 +21,53 @@ def gen_distance_matrix(tsp_coordinates):
     distances[torch.arange(n_nodes), torch.arange(n_nodes)] = 1e-10 # note here
     return distances
 
-def gen_pyg_data(demands, distances, device):
+def gen_pyg_data(demands, distances, device, k_nearest=None):
+    """
+    Build PyG Data object.
+    
+    Args:
+        demands: (n,) tensor
+        distances: (n, n) tensor  
+        device: torch device
+        k_nearest: if None, builds fully connected graph (n² edges)
+                   if int, builds kNN graph matching FACO's nn_list (n*k edges)
+    """
     n = demands.size(0)
-    nodes = torch.arange(n, device=device)
-    u = nodes.repeat(n)
-    v = torch.repeat_interleave(nodes, n)
-    edge_index = torch.stack((u, v))
-    edge_attr = distances.reshape(((n)**2, 1))
+    
+    if k_nearest is None:
+        # Fully connected graph (original behavior)
+        nodes = torch.arange(n, device=device)
+        u = nodes.repeat(n)
+        v = torch.repeat_interleave(nodes, n)
+        edge_index = torch.stack((u, v))
+        edge_attr = distances.reshape(((n)**2, 1))
+    else:
+        # kNN graph matching FACO's nn_list structure
+        k = min(k_nearest, n - 1)
+        
+        # For each node, find k nearest neighbors (excluding self)
+        # This matches build_nearest_neighbor_lists in faco.py
+        u_list = []
+        v_list = []
+        dist_list = []
+        
+        for i in range(n):
+            # Get distances from node i, set self-distance to inf to exclude
+            dists_i = distances[i].clone()
+            dists_i[i] = float('inf')
+            
+            # Get k nearest neighbors
+            _, nn_indices = torch.topk(dists_i, k, largest=False)
+            
+            # Add edges i -> each neighbor
+            for j in nn_indices:
+                u_list.append(i)
+                v_list.append(j.item())
+                dist_list.append(distances[i, j].item())
+        
+        edge_index = torch.tensor([u_list, v_list], dtype=torch.long, device=device)
+        edge_attr = torch.tensor(dist_list, dtype=torch.float32, device=device).unsqueeze(1)
+    
     x = demands
     pyg_data = Data(x=x.unsqueeze(1), edge_attr=edge_attr, edge_index=edge_index)
     return pyg_data
