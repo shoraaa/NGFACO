@@ -245,17 +245,8 @@ class FACO:
                 if v >= 0:
                     self.nn_index_map[i, v] = j
 
-        # pheromone_sparse: (n,k)
-        if pheromone is None:
-            self.pheromone_sparse = torch.ones((self.n, self.k), device=device)
-        else:
-            pheromone = pheromone.to(device)
-            if pheromone.shape == (self.n, self.k):
-                self.pheromone_sparse = pheromone
-            elif pheromone.shape == (self.n, self.n):
-                self.pheromone_sparse = self._compress_full_to_sparse(pheromone)
-            else:
-                raise ValueError(f"pheromone must be (n,n) or (n,k), got {pheromone.shape}")
+        # pheromone_sparse: (n,k) - will be initialized after tau_max is computed
+        self._pheromone_init = pheromone  # store for later initialization
 
         # heuristic_sparse: (n,k)
         if heuristic is None:
@@ -273,18 +264,37 @@ class FACO:
         # init best solution
         self.best_flat = self._init_greedy_solution_flat()
         self.best_cost = route_cost_flat(self.best_flat, self.dist)
+        
+        # MMAS parameters
+        self.p_best = 0.05  # MMAS typical default
+        self.tau_min, self.tau_max = self._calc_trail_limits(self.best_cost)
+        
+        # Now initialize pheromone with tau_max (MMAS standard)
+        if self._pheromone_init is None:
+            self.pheromone_sparse = torch.full((self.n, self.k), self.tau_max, device=device, dtype=torch.float32)
+        else:
+            pheromone = self._pheromone_init.to(device)
+            if pheromone.shape == (self.n, self.k):
+                self.pheromone_sparse = pheromone
+            elif pheromone.shape == (self.n, self.n):
+                self.pheromone_sparse = self._compress_full_to_sparse(pheromone)
+            else:
+                raise ValueError(f"pheromone must be (n,n) or (n,k), got {pheromone.shape}")
+            # Clamp initial pheromone to MMAS bounds
+            self.pheromone_sparse.clamp_(min=self.tau_min, max=self.tau_max)
+        del self._pheromone_init
 
     # ------------------------------------------------------------
     # Helpers for sparse conversion
     # ------------------------------------------------------------
 
     def _compress_full_to_sparse(self, full_matrix: torch.Tensor) -> torch.Tensor:
-        sparse = torch.zeros((self.n, self.k), device=full_matrix.device)
+        """Extract sparse (n, k) from full (n, n) matrix, preserving gradients."""
         nn = torch.from_numpy(self.nn_list).to(full_matrix.device)
         rows = torch.arange(self.n, device=full_matrix.device).unsqueeze(1).expand(self.n, self.k)
-        cols = nn.clamp_min(0)
-        sparse[:, :] = full_matrix[rows, cols]
-        sparse = sparse.clamp_min(1e-10)
+        cols = nn.clamp_min(0)  # Clamp -1 padding to 0 (will extract garbage but won't be used)
+        # Use direct advanced indexing - this preserves gradient!
+        sparse = full_matrix[rows, cols].clamp_min(1e-10)
         return sparse
 
     def _default_heuristic_sparse(self) -> torch.Tensor:
@@ -416,6 +426,12 @@ class FACO:
                 logps.append(res.logp)
                 traces.append(res.trace)
 
+                # prob_sparse is the same tensor used to sample
+                lp_re = self.replay_logp(res.trace, invtemp=invtemp, ref_flat=ref_flat, prob_sparse=prob_sparse)
+                err = (lp_re.detach() - res.logp.detach()).abs().item()
+                if err > 1e-4:
+                    print("[REPLAY MISMATCH INSIDE SAMPLE]", err)
+
         if require_prob:
             logps_t = torch.stack(logps) if len(logps) else torch.zeros((self.n_ants,), device=self.device)
             return costs, flats, touched_list, logps_t, traces
@@ -494,6 +510,13 @@ class FACO:
             rs = int(route_id[v])
             if rt < 0 or rs < 0:
                 return [], []
+            
+            # Early exit if v already follows curr (no-op move)
+            pt = int(pos_in_route[curr])
+            tgt = routes[rt]
+            succ_curr = 0 if pt == (len(tgt) - 1) else tgt[pt + 1]
+            if succ_curr == v:
+                return [], [curr, v]
 
             # source info
             ps = int(pos_in_route[v])
@@ -543,66 +566,108 @@ class FACO:
         max_steps = (self.n - 1) * 3
         steps = 0
 
-        while new_edges < target_new_edges and steps < max_steps:
-            steps += 1
-
+        def pick_next(current: int):
+            """Return (v, lp_tensor_or_None). lp is 0 for deterministic fallbacks."""
+            # ---------- (1) candidate list roulette ----------
             cand = self.nn_list[current]  # (k,)
             feasible_vs: List[int] = []
             feasible_w = []
 
             if require_prob:
-                # torch weights with grad
                 w_row: torch.Tensor = prob_sparse[current]  # (k,)
                 for j in range(self.k):
                     v = int(cand[j])
-                    if v <= 0:
-                        continue
-                    if visited[v] == 1:
-                        continue
-                    if not feasible_insert(current, v):
+                    if v <= 0 or visited[v] == 1 or (not feasible_insert(current, v)):
                         continue
                     feasible_vs.append(v)
                     feasible_w.append(w_row[j].clamp_min(EPS))
             else:
-                # numpy weights
                 w_row = prob_sparse[current].astype(np.float64)
                 for j in range(self.k):
                     v = int(cand[j])
-                    if v <= 0:
-                        continue
-                    if visited[v] == 1:
-                        continue
-                    if not feasible_insert(current, v):
+                    if v <= 0 or visited[v] == 1 or (not feasible_insert(current, v)):
                         continue
                     feasible_vs.append(v)
                     feasible_w.append(float(w_row[j]))
 
-            if len(feasible_vs) == 0:
-                # deterministic restart: smallest unvisited customer
+            if len(feasible_vs) > 0:
+                if require_prob:
+                    cand_nodes_t = torch.tensor(feasible_vs, dtype=torch.long, device=self.device)
+                    w = torch.stack(feasible_w)              # (m,)
+                    p = w / (w.sum() + EPS)
+                    dist = Categorical(probs=p)
+                    idx = dist.sample()
+                    v = int(cand_nodes_t[idx].item())
+                    lp = dist.log_prob(idx)
+                    return v, lp
+                else:
+                    w = np.array(feasible_w, dtype=np.float64) + 1e-12
+                    w = w / w.sum()
+                    v = int(np.random.choice(np.array(feasible_vs, dtype=np.int64), p=w))
+                    return v, None
+
+            # ---------- (2) backup list first feasible ----------
+            for vv in self.backup_nn_list[current]:
+                v = int(vv)
+                if v < 0:
+                    break
+                if v <= 0 or visited[v] == 1:
+                    continue
+                if not feasible_insert(current, v):
+                    continue
+                if require_prob:
+                    return v, torch.tensor(0.0, device=self.device)
+                return v, None
+
+            # ---------- (3) global fallback: nearest feasible ----------
+            best_v = -1
+            best_d = 1e30
+            # only customers
+            for v in range(1, self.n):
+                if visited[v] == 1:
+                    continue
+                if not feasible_insert(current, v):
+                    continue
+                d = float(self.dist[current, v])
+                if d < best_d - 1e-12 or (abs(d - best_d) <= 1e-12 and v < best_v):
+                    best_d = d
+                    best_v = v
+
+            if best_v >= 0:
+                if require_prob:
+                    return best_v, torch.tensor(0.0, device=self.device)
+                return best_v, None
+
+            # nothing feasible under CVRP constraints
+            return -1, None
+
+        while new_edges < target_new_edges and steps < max_steps:
+            steps += 1
+
+            v, lp = pick_next(current)
+
+            if v < 0:
+                # ---------- (4) CVRP-only: restart current ----------
                 unv = np.where(visited[1:] == 0)[0] + 1
                 if unv.size == 0:
                     break
-                current = int(unv.min())
+                new_current = int(unv.min())
+                
+                # Record restart in trace: use negative choice to signal restart
+                if require_prob:
+                    curr_seq.append(int(current))
+                    choice_seq.append(-new_current)  # negative signals restart to this node
+                    logps.append(torch.tensor(0.0, device=self.device))  # deterministic
+                
+                current = new_current
                 visited[current] = 1
                 continue
 
+            # IMPORTANT: record every action (even deterministic fallbacks)
             if require_prob:
-                cand_nodes_t = torch.tensor(feasible_vs, dtype=torch.long, device=self.device)
-                w = torch.stack(feasible_w)  # (m,)
-                p = w / (w.sum() + EPS)
-                dist = Categorical(probs=p)
-                idx = dist.sample()
-                v = int(cand_nodes_t[idx].item())
-                lp = dist.log_prob(idx)
-
                 curr_seq.append(int(current))
                 choice_seq.append(int(v))
-                logps.append(lp)
-            else:
-                w = np.array(feasible_w, dtype=np.float64)
-                w = w + 1e-12
-                w = w / w.sum()
-                v = int(np.random.choice(np.array(feasible_vs, dtype=np.int64), p=w))
+                logps.append(lp if lp is not None else torch.tensor(0.0, device=self.device))
 
             added_edges, touched_nodes = relocate_after(current, v)
 
@@ -702,6 +767,8 @@ class FACO:
         invtemp: float = 1.0,
         ref_flat: Optional[np.ndarray] = None,
         prob_sparse: Optional[torch.Tensor] = None,
+        return_entropy: bool = False,
+        return_n_terms: bool = False,
     ) -> torch.Tensor:
         """
         Recompute logπ for the stored trace under the *current* heuristic/pheromone.
@@ -714,6 +781,8 @@ class FACO:
           invtemp: used if prob_sparse is None
           ref_flat: if None, uses self.best_flat snapshot at call time (usually you want the original state's best_flat)
           prob_sparse: optional precomputed (n,k) torch probs for that state
+          return_entropy: if True, returns (logp, entropy) tuple where entropy is from feasible distribution
+          return_n_terms: if True, also returns number of stochastic terms accumulated
         """
         if ref_flat is None:
             ref_flat = self.best_flat
@@ -793,6 +862,8 @@ class FACO:
         visited[current] = 1
 
         logps: List[torch.Tensor] = []
+        entropies: List[torch.Tensor] = []  # Track entropy from feasible distribution
+        n_stochastic_terms = 0  # Count only stochastic (candidate-list) terms
         curr_seq = trace.curr_seq.detach().cpu().numpy()
         choice_seq = trace.choice_seq.detach().cpu().numpy()
 
@@ -801,6 +872,28 @@ class FACO:
             v_t = int(choice_seq[t])
 
             current = curr_t
+
+            # Handle restart signal (negative v_t means restart to abs(v_t))
+            if v_t < 0:
+                new_current = -v_t
+                # Verify deterministic restart matches trace
+                unv = np.where(visited[1:] == 0)[0] + 1
+                if unv.size == 0 or int(unv.min()) != new_current:
+                    # Restart mismatch
+                    if return_entropy:
+                        if return_n_terms:
+                            return torch.tensor(float("-inf"), device=self.device), torch.tensor(0.0, device=self.device), n_stochastic_terms
+                        return torch.tensor(float("-inf"), device=self.device), torch.tensor(0.0, device=self.device)
+                    if return_n_terms:
+                        return torch.tensor(float("-inf"), device=self.device), n_stochastic_terms
+                    return torch.tensor(float("-inf"), device=self.device)
+                
+                # Restart is deterministic => no log-prob contribution, no stochastic count
+                logps.append(torch.tensor(0.0, device=self.device))
+                entropies.append(torch.tensor(0.0, device=self.device))
+                current = new_current
+                visited[current] = 1
+                continue
 
             # build feasible candidate list as in sampler
             cand = self.nn_list[current]
@@ -820,16 +913,63 @@ class FACO:
                 feasible_w.append(w_row[j].clamp_min(EPS))
 
             if len(feasible_vs) == 0:
-                # deterministic restart (must match sampler)
-                unv = np.where(visited[1:] == 0)[0] + 1
-                if unv.size == 0:
-                    return torch.tensor(float("-inf"), device=self.device)
-                current = int(unv.min())
-                visited[current] = 1
-                # redo this timestep under the restarted current? Trace expects an action here,
-                # so if we restart during replay but trace doesn't, it's inconsistent -> -inf.
-                return torch.tensor(float("-inf"), device=self.device)
+                # ---------- (2) backup list first feasible ----------
+                det_v = -1
+                for vv in self.backup_nn_list[current]:
+                    v = int(vv)
+                    if v < 0:
+                        break
+                    if v <= 0 or visited[v] == 1:
+                        continue
+                    if not feasible_insert(current, v):
+                        continue
+                    det_v = v
+                    break
 
+                # ---------- (3) global nearest fallback ----------
+                if det_v < 0:
+                    best_v = -1
+                    best_d = 1e30
+                    for v in range(1, self.n):
+                        if visited[v] == 1:
+                            continue
+                        if not feasible_insert(current, v):
+                            continue
+                        d = float(self.dist[current, v])
+                        if d < best_d - 1e-12 or (abs(d - best_d) <= 1e-12 and v < best_v):
+                            best_d = d
+                            best_v = v
+                    det_v = best_v
+
+                if det_v < 0:
+                    # CVRP-only: restart mismatch → -inf
+                    if return_entropy:
+                        if return_n_terms:
+                            return torch.tensor(float("-inf"), device=self.device), torch.tensor(0.0, device=self.device), n_stochastic_terms
+                        return torch.tensor(float("-inf"), device=self.device), torch.tensor(0.0, device=self.device)
+                    if return_n_terms:
+                        return torch.tensor(float("-inf"), device=self.device), n_stochastic_terms
+                    return torch.tensor(float("-inf"), device=self.device)
+
+                # trace must match deterministic choice
+                if v_t != det_v:
+                    if return_entropy:
+                        if return_n_terms:
+                            return torch.tensor(float("-inf"), device=self.device), torch.tensor(0.0, device=self.device), n_stochastic_terms
+                        return torch.tensor(float("-inf"), device=self.device), torch.tensor(0.0, device=self.device)
+                    if return_n_terms:
+                        return torch.tensor(float("-inf"), device=self.device), n_stochastic_terms
+                    return torch.tensor(float("-inf"), device=self.device)
+
+                # deterministic action => logp += 0, entropy += 0, no stochastic count
+                logps.append(torch.tensor(0.0, device=self.device))
+                entropies.append(torch.tensor(0.0, device=self.device))
+                relocate_after(current, v_t)
+                visited[v_t] = 1
+                current = v_t
+                continue
+
+            # ---------- candidate list action (stochastic) ----------
             cand_nodes_t = torch.tensor(feasible_vs, dtype=torch.long, device=self.device)
             w = torch.stack(feasible_w)
             p = w / (w.sum() + EPS)
@@ -837,33 +977,84 @@ class FACO:
 
             idx = (cand_nodes_t == v_t).nonzero(as_tuple=False)
             if idx.numel() == 0:
+                if return_entropy:
+                    if return_n_terms:
+                        return torch.tensor(float("-inf"), device=self.device), torch.tensor(0.0, device=self.device), n_stochastic_terms
+                    return torch.tensor(float("-inf"), device=self.device), torch.tensor(0.0, device=self.device)
+                if return_n_terms:
+                    return torch.tensor(float("-inf"), device=self.device), n_stochastic_terms
                 return torch.tensor(float("-inf"), device=self.device)
             idx = idx[0, 0]
 
             logps.append(dist.log_prob(idx))
+            entropies.append(dist.entropy())  # Entropy from feasible distribution
+            n_stochastic_terms += 1  # This is a stochastic choice
 
             relocate_after(current, v_t)
             visited[v_t] = 1
             current = v_t
 
-        return torch.stack(logps).sum() if len(logps) else torch.tensor(0.0, device=self.device)
+        logp_sum = torch.stack(logps).sum() if len(logps) else torch.tensor(0.0, device=self.device)
+        if return_entropy:
+            ent_mean = torch.stack(entropies).mean() if len(entropies) else torch.tensor(0.0, device=self.device)
+            if return_n_terms:
+                return logp_sum, ent_mean, n_stochastic_terms
+            return logp_sum, ent_mean
+        if return_n_terms:
+            return logp_sum, n_stochastic_terms
+        return logp_sum
+
+    # ------------------------------------------------------------
+    # MMAS trail limits computation
+    # ------------------------------------------------------------
+
+    def _calc_trail_limits(self, best_cost: float) -> tuple:
+        """
+        Compute MMAS trail limits [tau_min, tau_max].
+        
+        Based on candidate-list variant used in FACO/MFACO:
+        - tau_max = 1 / (best_cost * (1 - rho))
+        - tau_min uses candidate list size (k) as avg
+        """
+        # Map decay to MMAS rho (evaporation rate)
+        rho = 1.0 - float(self.decay)
+        rho = min(max(rho, 1e-6), 1.0 - 1e-6)
+        
+        tau_max = 1.0 / (float(best_cost) * (1.0 - rho) + 1e-12)
+        
+        # Candidate-list version: use k as avg
+        avg = float(max(self.k, 2))
+        p = float(self.p_best) ** (1.0 / avg)
+        tau_min = min(tau_max, tau_max * (1.0 - p) / ((avg - 1.0) * p + 1e-12))
+        
+        return float(tau_min), float(tau_max)
 
     # ------------------------------------------------------------
     # Pheromone update (elitist best)
     # ------------------------------------------------------------
 
     def _update_pheromone_from_flat(self, flat: np.ndarray, cost: float):
+        """
+        MMAS-style pheromone update with trail limits.
+        
+        Evaporate, clamp to [tau_min, tau_max], deposit, and clamp again.
+        Note: tau_min/tau_max are updated in run() when best improves.
+        """
+        # Evaporation and clamp to bounds
         self.pheromone_sparse.mul_(self.decay)
-        delta = 1.0 / (cost + 1e-9)
-
+        self.pheromone_sparse.clamp_(min=self.tau_min, max=self.tau_max)
+        
+        # Deposit pheromone on best solution edges
+        delta = 1.0 / (float(cost) + 1e-12)
+        
         u = flat[:-1].astype(np.int64)
         v = flat[1:].astype(np.int64)
         for a, b in zip(u, v):
             j = self.nn_index_map[a, b]
             if j >= 0:
-                self.pheromone_sparse[a, j] += float(delta)
-
-        self.pheromone_sparse.clamp_(min=1e-10)
+                # Add delta and clamp to tau_max
+                new_val = float(self.pheromone_sparse[a, j]) + delta
+                self.pheromone_sparse[a, j] = min(new_val, self.tau_max)
 
     # ------------------------------------------------------------
     # Main run loop
@@ -881,6 +1072,8 @@ class FACO:
             if best_cost < self.best_cost:
                 self.best_cost = best_cost
                 self.best_flat = best_flat
+                # Recompute MMAS trail limits based on new best cost
+                self.tau_min, self.tau_max = self._calc_trail_limits(self.best_cost)
 
             self._update_pheromone_from_flat(best_flat, best_cost)
 

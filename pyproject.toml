@@ -10,6 +10,7 @@ dependencies = [
     "ipywidgets>=8.1.8",
     "jupyter>=1.1.1",
     "numba>=0.63.1",
+    "pybind11>=3.0.1",
     "torch-geometric>=2.7.0",
     "tqdm>=4.67.1",
     "wandb>=0.23.1",

@@ -1,0 +1,10 @@
+pyproject.toml
+setup.py
+/home/shora/Research/NGFACO/tsp/src/binding.cpp
+/home/shora/Research/NGFACO/tsp/src/mfaco_train.cpp
+faco_cpp.egg-info/PKG-INFO
+faco_cpp.egg-info/SOURCES.txt
+faco_cpp.egg-info/dependency_links.txt
+faco_cpp.egg-info/not-zip-safe
+faco_cpp.egg-info/requires.txt
+faco_cpp.egg-info/top_level.txt

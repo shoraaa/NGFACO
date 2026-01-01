@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=45", "pybind11>=2.6", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "faco_cpp"
+version = "0.1.0"
+description = "C++ MFACO Training Module for fast neural-guided ACO training"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.19",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.setuptools]
+# Explicitly disable package discovery - this is a C++ extension only
+packages = []
+py-modules = []

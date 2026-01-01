@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: faco_cpp
+Version: 0.1.0
+Summary: C++ MFACO Training Module for fast neural-guided ACO training
+Requires-Python: >=3.8
+Requires-Dist: numpy>=1.19
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
