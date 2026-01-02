@@ -2,7 +2,6 @@ __pycache__/
 ablation*
 exp*
 .vscode
-data/*
 .DS_Store
 bpp
 cvrp_nls
