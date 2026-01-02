@@ -11,16 +11,20 @@ Key features:
 - Baseline caching for reduced variance
 - Support for REINFORCE and A2C
 """
-
 from __future__ import annotations
-import os
-import json
-import pickle
+
 import argparse
 import hashlib
+import json
+import logging
+import os
+import pickle
+import time
+from copy import deepcopy
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -28,9 +32,6 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch_geometric.data import Data as PyGData
-from copy import deepcopy
-import time
-import logging
 
 try:
     import wandb
@@ -54,21 +55,9 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 def stable_hash(key: Tuple) -> int:
-    """
-    Compute a stable hash that is consistent across Python runs.
-    Unlike Python's hash(), this is not salted per process.
-    
-    Args:
-        key: tuple of hashable items (e.g., (snapshot_id, H))
-    
-    Returns:
-        Positive integer in [0, 2^31)
-    """
-    # Convert key to bytes
+    """Compute a stable hash consistent across Python runs."""
     key_str = str(key).encode('utf-8')
-    # Use SHA256 for stability
     digest = hashlib.sha256(key_str).digest()
-    # Take first 4 bytes and convert to int
     return int.from_bytes(digest[:4], 'big') % (2**31)
 
 
@@ -79,48 +68,49 @@ def stable_hash(key: Tuple) -> int:
 @dataclass
 class TrainConfig:
     """Training configuration with all hyperparameters."""
-    
+
     # Instance generation
     n_nodes: int = 500
     n_instances: int = 1000
-    
+
     # Snapshot generation
-    warmup_iterations: int = 50       # iterations before taking snapshots
-    snapshot_interval: int = 10       # take snapshot every N iterations
-    max_iterations: int = 200         # max iterations per instance
-    snapshots_per_instance: int = 10  # max snapshots per instance
-    
+    warmup_iterations: int = 50
+    snapshot_interval: int = 10
+    max_iterations: int = 1000
+    snapshots_per_instance: int = 10
+
     # Training
-    batch_size: int = 32
-    n_epochs: int = 15
+    batch_size: int = 4
+    # Number of snapshot samples per epoch (training draws from the snapshot dataset with replacement).
+    # If None, defaults to using the full dataset length.
+    epoch_size: Optional[int] = None
+    grad_accum_steps: int = 1
+    n_epochs: int = 10
     lr: float = 1e-4
     weight_decay: float = 1e-5
     max_grad_norm: float = 1.0
-    
+
     # Continuation horizon
-    # If `fixed_H` is not None, training/validation always uses that horizon
-    # (no curriculum schedule).
     fixed_H: Optional[int] = 10
-    H_min: int = 10                   # used only when fixed_H is None
-    H_max: int = 50                   # used only when fixed_H is None
-    H_warmup_epochs: int = 20         # used only when fixed_H is None
-    
+    H_min: int = 10
+    H_max: int = 50
+    H_warmup_epochs: int = 20
+
     # Residual policy
-    gamma_residual: float = 0.5       # scale for residual logits
-    
+    gamma_residual: float = 1.0
+
     # REINFORCE / A2C
     use_a2c: bool = False
     entropy_coeff: float = 0.003
     value_coeff: float = 0.5
     normalize_advantage: bool = True
-    
+
     # Curriculum (snapshot sampling)
-    # If False, sample uniformly from all snapshots (no easy/hard weighting).
     use_curriculum: bool = True
     stagnation_weight_easy: float = 0.2
     stagnation_weight_hard: float = 0.8
     curriculum_warmup_epochs: int = 20
-    
+
     # FACO parameters
     n_ants: int = 32
     cand_list_size: int = 32
@@ -129,13 +119,17 @@ class TrainConfig:
     decay: float = 0.9
     alpha: float = 1.0
     use_local_search: bool = True
-    disable_heuristic: bool = True      # if True, ants use pheromone + residual only (eta=1)
+    disable_heuristic: bool = False
 
     # Parallelism (C++ backend)
-    # NOTE: Traced sampling (`require_prob=True`) is typically dominated by Python replay,
-    # and parallelizing it can be slower due to overhead. Leave False unless profiled.
     parallel_traced: bool = False
-    
+
+    # Ablations
+    # If True, baseline continuation uses the traced sampler (require_prob=True) so that
+    # baseline and neural rollouts can be paired via identical RNG consumption.
+    # If False, baseline uses the fast sampler (require_prob=False), which is not paired.
+    paired_randomness: bool = True
+
     # Network
     node_feats: int = 2
     edge_feats: int = 1
@@ -143,33 +137,32 @@ class TrainConfig:
     units: int = 64
     encoder_depth: int = 4
     scorer_hidden: int = 64
-    
+
     # Baseline cache
     use_baseline_cache: bool = True
-    baseline_seeds: int = 1           # Use 1 for training (paired with neural), >1 only for validation
-    
+    baseline_seeds: int = 1
+
     # Logging and checkpointing
     log_interval: int = 1
     save_interval: int = 1
     checkpoint_dir: str = "checkpoints"
-    snapshot_dir: str = "snapshots"  # Base directory; actual dir will be config-specific
-    
+    snapshot_dir: str = "snapshots"
+
     def get_snapshot_dir(self) -> str:
-        """Get configuration-specific snapshot directory."""
-        return f"{self.snapshot_dir}/n{self.n_nodes}_k{self.cand_list_size}_ants{self.n_ants}"
-    
+        return f"{self.snapshot_dir}/n{self.n_nodes}_k{self.cand_list_size}_ants{self.n_ants}_warm{self.warmup_iterations}"
+
     # Wandb
     use_wandb: bool = True
     wandb_project: str = "neural-faco"
     wandb_run_name: Optional[str] = None
-    
+
     # Validation during training
-    val_interval: int = 1             # validate every N epochs
-    val_instances: int = 100           # number of instances for validation
-    
+    val_interval: int = 1
+    val_instances: int = 100
+
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    
+
     # Reproducibility
     seed: int = 42
 
@@ -445,6 +438,32 @@ class BaselineCache:
             arrays.append(np.asarray(arr, dtype=np.float32))
         return np.mean(np.stack(arrays, axis=0), axis=0)
 
+
+class FullRunBaselineCache:
+    """Persistent cache for *full-run* baseline FACO results on fixed datasets."""
+
+    def __init__(self, cache_file: Optional[str] = None):
+        self.cache: Dict[Tuple[str, int, int, int], float] = {}
+        self.cache_file = cache_file
+        if cache_file and os.path.exists(cache_file):
+            self._load()
+
+    def _load(self):
+        with open(self.cache_file, 'rb') as f:
+            self.cache = pickle.load(f)
+        logger.info(f"Loaded full-run baseline cache with {len(self.cache)} entries")
+
+    def save(self):
+        if self.cache_file:
+            with open(self.cache_file, 'wb') as f:
+                pickle.dump(self.cache, f)
+
+    def get(self, dataset_id: str, instance_idx: int, max_iterations: int, seed: int) -> Optional[float]:
+        return self.cache.get((dataset_id, int(instance_idx), int(max_iterations), int(seed)))
+
+    def set(self, dataset_id: str, instance_idx: int, max_iterations: int, seed: int, best_cost: float) -> None:
+        self.cache[(dataset_id, int(instance_idx), int(max_iterations), int(seed))] = float(best_cost)
+
 import json, hashlib
 from dataclasses import asdict
 
@@ -454,6 +473,30 @@ def config_fingerprint(config: TrainConfig) -> str:
     keep = {
         "n_nodes","n_ants","cand_list_size","backup_list_size","min_new_edges",
         "decay","alpha","use_local_search","disable_heuristic",
+    }
+    d = {k: d[k] for k in keep}
+    s = json.dumps(d, sort_keys=True)
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:10]
+
+
+def baseline_cache_fingerprint(config: TrainConfig) -> str:
+    """Fingerprint for *snapshot-continuation* baseline cache.
+
+    Includes flags that can change baseline rollout randomness/sampler behavior.
+    """
+    d = asdict(config)
+    keep = {
+        "n_nodes",
+        "n_ants",
+        "cand_list_size",
+        "backup_list_size",
+        "min_new_edges",
+        "decay",
+        "alpha",
+        "use_local_search",
+        "disable_heuristic",
+        "parallel_traced",
+        "paired_randomness",
     }
     d = {k: d[k] for k in keep}
     s = json.dumps(d, sort_keys=True)
@@ -555,7 +598,6 @@ def restore_faco_from_snapshot(snapshot: Snapshot, config: TrainConfig,
         use_local_search=config.use_local_search,
         enable_torch_sync=True,
         device=device,
-        use_cpp=not config.disable_heuristic,
         disable_heuristic=config.disable_heuristic,
     )
 
@@ -798,32 +840,42 @@ def run_neural_continuation(
     ant_best_cost = np.full((A,), np.inf, dtype=np.float32)
 
     for iter_idx in range(H):
-        # --- Build lightweight dynamic features from CURRENT pheromone ---
-        tau = faco.pheromone_sparse.detach().clamp_min(1e-12)  # (n,k), detached!
+        extra = None
+        if int(config.extra_feats) > 0:
+            # --- Build lightweight dynamic features from CURRENT pheromone ---
+            tau = faco.pheromone_sparse.detach().clamp_min(1e-12)  # (n,k), detached!
 
-        logtau = torch.log(tau)
-        mu = logtau.mean(dim=1, keepdim=True)
-        std = logtau.std(dim=1, keepdim=True).clamp_min(1e-6)
-        logtau_z = (logtau - mu) / std  # (n,k)
+            logtau = torch.log(tau)
+            mu = logtau.mean(dim=1, keepdim=True)
+            std = logtau.std(dim=1, keepdim=True).clamp_min(1e-6)
+            logtau_z = (logtau - mu) / std  # (n,k)
 
-        # Rank feature in [0,1] within each row (cheap since k is small)
-        ranks = torch.argsort(torch.argsort(tau, dim=1), dim=1).float()
-        tau_rank01 = ranks / (k - 1 + 1e-8)  # (n,k)
+            # Rank feature in [0,1] within each row (cheap since k is small)
+            ranks = torch.argsort(torch.argsort(tau, dim=1), dim=1).float()
+            tau_rank01 = ranks / (k - 1 + 1e-8)  # (n,k)
 
-        # Broadcast small context features to (n,k,1)
-        stagn_feat = torch.full((n, k, 1), stagn0, device=device, dtype=torch.float32)
-        # simple "local progress" feature (optional but often helps)
-        prog = min(1.0, iter_frac0 + (iter_idx / max(1, H)))
-        prog_feat = torch.full((n, k, 1), float(prog), device=device, dtype=torch.float32)
+            # Broadcast small context features to (n,k,1)
+            stagn_feat = torch.full((n, k, 1), stagn0, device=device, dtype=torch.float32)
+            # simple "local progress" feature (optional but often helps)
+            prog = min(1.0, iter_frac0 + (iter_idx / max(1, H)))
+            prog_feat = torch.full((n, k, 1), float(prog), device=device, dtype=torch.float32)
 
-        # Pack extra feats: (n,k,C)
-        # C must match Net(extra_feats=C) if you use ResidualScorerWithContext
-        extra = torch.cat([
-            logtau_z.unsqueeze(-1),       # (n,k,1)
-            tau_rank01.unsqueeze(-1),     # (n,k,1)
-            stagn_feat,                  # (n,k,1)
-            prog_feat,                   # (n,k,1)
-        ], dim=-1)  # (n,k,4)
+            # Base layout used by existing models: (n,k,4)
+            base_extra = torch.cat(
+                [
+                    logtau_z.unsqueeze(-1),       # (n,k,1)
+                    tau_rank01.unsqueeze(-1),     # (n,k,1)
+                    stagn_feat,                   # (n,k,1)
+                    prog_feat,                    # (n,k,1)
+                ],
+                dim=-1,
+            )
+            C = int(config.extra_feats)
+            if C <= base_extra.size(-1):
+                extra = base_extra[..., :C]
+            else:
+                pad = torch.zeros((n, k, C - base_extra.size(-1)), device=device, dtype=base_extra.dtype)
+                extra = torch.cat([base_extra, pad], dim=-1)
 
         # --- Vectorized residual logits using cached node embeddings ---
         # Build (n,k,d) embeddings
@@ -832,7 +884,10 @@ def run_neural_continuation(
         v_emb = node_emb[faco.nn_torch]                  # (n,k,d)
 
         # Edge feature tensor (n,k,F)
-        edge_feat = torch.cat([u_emb, v_emb, dist_feat, extra], dim=-1)
+        if extra is None:
+            edge_feat = torch.cat([u_emb, v_emb, dist_feat], dim=-1)
+        else:
+            edge_feat = torch.cat([u_emb, v_emb, dist_feat, extra], dim=-1)
 
         # IMPORTANT: use the scorer MLP that exists in your Net
         # (nn.Linear works on (n,k,F) directly)
@@ -1036,12 +1091,24 @@ def train_step(
                 # Compute and cache with consistent seeds
                 for seed_idx in range(config.baseline_seeds):
                     actual_seed = base_seed + seed_idx
-                    c, ant = run_baseline_continuation_with_antbest(snapshot, H, actual_seed, config)
+                    c, ant = run_baseline_continuation_with_antbest(
+                        snapshot,
+                        H,
+                        actual_seed,
+                        config,
+                        use_traced=bool(config.paired_randomness),
+                    )
                     baseline_cache.set_full(snapshot_id, H, actual_seed, c, ant)
                 c_base = baseline_cache.get_avg(snapshot_id, H, config.baseline_seeds, base_seed=base_seed)
                 ant_base = baseline_cache.get_antbest_avg(snapshot_id, H, config.baseline_seeds, base_seed=base_seed)
         else:
-            c_base, ant_base = run_baseline_continuation_with_antbest(snapshot, H, base_seed, config)
+            c_base, ant_base = run_baseline_continuation_with_antbest(
+                snapshot,
+                H,
+                base_seed,
+                config,
+                use_traced=bool(config.paired_randomness),
+            )
         baseline_time += time.time() - t0
         
         baseline_costs.append(c_base)
@@ -1091,6 +1158,105 @@ def train_step(
     return stats
 
 
+def compute_batch_loss_and_stats(
+    batch_ids: List[str],
+    dataset: SnapshotDataset,
+    net: Net,
+    value_net: Optional[ValueNet],
+    baseline_cache: BaselineCache,
+    H: int,
+    config: TrainConfig,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Forward pass over a snapshot batch.
+
+    Returns:
+        loss: scalar tensor (requires grad)
+        stats: scalar metrics for logging (no backward/optimizer step performed)
+    """
+    step_start = time.time()
+
+    device = config.device
+    net.train()
+    if value_net is not None:
+        value_net.train()
+
+    results: List[ContinuationResult] = []
+    baseline_costs: List[float] = []
+    baseline_ant_costs_list: List[torch.Tensor] = []
+
+    # Timing accumulators
+    baseline_time = 0.0
+    neural_time = 0.0
+
+    for snapshot_id in batch_ids:
+        snapshot = dataset.get(snapshot_id)
+
+        # Use stable hash for reproducible seeds across runs
+        base_seed = stable_hash((snapshot_id, H))
+
+        # Get baseline cost (from cache or compute)
+        t0 = time.time()
+        if config.use_baseline_cache:
+            c_base = baseline_cache.get_avg(snapshot_id, H, config.baseline_seeds, base_seed=base_seed)
+            ant_base = baseline_cache.get_antbest_avg(snapshot_id, H, config.baseline_seeds, base_seed=base_seed)
+            if c_base is None or ant_base is None:
+                for seed_idx in range(config.baseline_seeds):
+                    actual_seed = base_seed + seed_idx
+                    c, ant = run_baseline_continuation_with_antbest(
+                        snapshot,
+                        H,
+                        actual_seed,
+                        config,
+                        use_traced=bool(config.paired_randomness),
+                    )
+                    baseline_cache.set_full(snapshot_id, H, actual_seed, c, ant)
+                c_base = baseline_cache.get_avg(snapshot_id, H, config.baseline_seeds, base_seed=base_seed)
+                ant_base = baseline_cache.get_antbest_avg(snapshot_id, H, config.baseline_seeds, base_seed=base_seed)
+        else:
+            c_base, ant_base = run_baseline_continuation_with_antbest(
+                snapshot,
+                H,
+                base_seed,
+                config,
+                use_traced=bool(config.paired_randomness),
+            )
+        baseline_time += time.time() - t0
+
+        baseline_costs.append(c_base)
+        baseline_ant_costs_list.append(torch.from_numpy(np.asarray(ant_base, dtype=np.float32)).to(device))
+
+        # Run neural continuation with SAME base seed for paired comparison
+        t0 = time.time()
+        result = run_neural_continuation(
+            snapshot=snapshot,
+            net=net,
+            H=H,
+            seed=base_seed,
+            config=config,
+            gamma=config.gamma_residual,
+        )
+        neural_time += time.time() - t0
+        results.append(result)
+
+    # Compute loss
+    t0 = time.time()
+    baseline_ant_costs = torch.stack(baseline_ant_costs_list, dim=0)  # (B,A)
+    loss, stats = compute_loss(results, baseline_costs, baseline_ant_costs, value_net, config)
+    loss_time = time.time() - t0
+
+    # Timing stats (no backward included here)
+    total_time = time.time() - step_start
+    stats['loss'] = float(loss.detach())
+    stats['time_total'] = total_time
+    stats['time_baseline'] = baseline_time
+    stats['time_neural'] = neural_time
+    stats['time_backward'] = 0.0
+    stats['throughput'] = len(batch_ids) / max(total_time, 1e-9)
+    stats['time_loss'] = loss_time
+
+    return loss, stats
+
+
 # =============================================================================
 # Snapshot Generation
 # =============================================================================
@@ -1102,6 +1268,172 @@ def generate_tsp_instance(n: int, seed: int = None) -> Tuple[np.ndarray, np.ndar
     coords = np.random.rand(n, 2).astype(np.float32)
     distances = np.sqrt(((coords[:, None, :] - coords[None, :, :]) ** 2).sum(-1))
     return coords, distances.astype(np.float32)
+
+
+def _default_test_dataset_path(n_nodes: int) -> Path:
+    # train.py lives in tsp/, dataset lives in data/tsp/
+    repo_root = Path(__file__).resolve().parent.parent
+    return repo_root / "data" / "tsp" / f"testDataset-{int(n_nodes)}.pt"
+
+
+def _default_val_dataset_path(n_nodes: int) -> Path:
+    # train.py lives in tsp/, dataset lives in data/tsp/
+    repo_root = Path(__file__).resolve().parent.parent
+    return repo_root / "data" / "tsp" / f"valDataset-{int(n_nodes)}.pt"
+
+
+def _coords_to_distance_matrix(coords: torch.Tensor) -> torch.Tensor:
+    """Compute EUC distance matrix with large diagonal (n,n)."""
+    coords = coords.to(dtype=torch.float32)
+    dist = torch.norm(coords[:, None, :] - coords[None, :, :], dim=-1, p=2)
+    # Avoid selecting self in candidate lists (safe even if excluded later)
+    dist.fill_diagonal_(1e9)
+    return dist
+
+
+def run_baseline_fullrun(
+    coords: torch.Tensor,
+    config: TrainConfig,
+    seed: int,
+) -> float:
+    """Run vanilla FACO from scratch for config.max_iterations and return best cost."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    distances_t = _coords_to_distance_matrix(coords).to("cpu")
+    faco = MFACO_TSP(
+        distances=distances_t,
+        n_ants=config.n_ants,
+        cand_list_size=config.cand_list_size,
+        backup_list_size=config.backup_list_size,
+        min_new_edges=config.min_new_edges,
+        decay=config.decay,
+        alpha=config.alpha,
+        use_local_search=config.use_local_search,
+        disable_heuristic=config.disable_heuristic,
+        device="cpu",
+    )
+    faco.enable_torch_sync = False
+    faco.seed_rng(seed)
+
+    for _ in range(int(config.max_iterations)):
+        costs, flats, _, _, _ = faco.sample(require_prob=False)
+        best_idx = int(np.argmin(costs))
+        best_cost = float(costs[best_idx])
+        best_flat = flats[best_idx]
+        faco._update_pheromone_from_flat(best_flat, best_cost)
+
+    return float(faco.best_cost)
+
+
+def run_neural_fullrun(
+    coords: torch.Tensor,
+    net: Net,
+    config: TrainConfig,
+    seed: int,
+) -> float:
+    """Run neural-guided FACO from scratch for config.max_iterations and return best cost."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    device = config.device
+    distances_t = _coords_to_distance_matrix(coords).to("cpu")
+    faco = MFACO_TSP(
+        distances=distances_t,
+        n_ants=config.n_ants,
+        cand_list_size=config.cand_list_size,
+        backup_list_size=config.backup_list_size,
+        min_new_edges=config.min_new_edges,
+        decay=config.decay,
+        alpha=config.alpha,
+        use_local_search=config.use_local_search,
+        disable_heuristic=config.disable_heuristic,
+        enable_torch_sync=True,
+        device=str(device),
+    )
+    faco.seed_rng(seed)
+
+    with torch.no_grad():
+        pyg = build_pyg_from_faco(faco, coords.detach().cpu().numpy().astype(np.float32), device)
+        net.encode(pyg)
+        faco.sync_pheromone_to_torch()
+
+        n, k = faco.n, faco.k
+
+        # Static distance feature on device
+        u_idx = np.arange(n)[:, None]
+        v_idx = faco.nn_list
+        dist_nk_np = faco.dist_np32[u_idx, v_idx].astype(np.float32)
+        dist_feat = torch.from_numpy(dist_nk_np).to(device=device, dtype=torch.float32).unsqueeze(-1)
+
+        # Static context scalars (same as training continuation)
+        stagn0 = 0.0
+        iter_frac0 = 0.0
+
+        node_emb = net._node_emb
+        u_emb = node_emb.unsqueeze(1).expand(-1, k, -1)
+        v_emb = node_emb[faco.nn_torch]
+
+        # If no extra features, residual logits are static across iterations
+        static_edge_feat = None
+        if int(config.extra_feats) == 0:
+            static_edge_feat = torch.cat([u_emb, v_emb, dist_feat], dim=-1)
+
+        for iter_idx in range(int(config.max_iterations)):
+            extra = None
+            if int(config.extra_feats) > 0:
+                tau = faco.pheromone_sparse.detach().clamp_min(1e-12)
+                logtau = torch.log(tau)
+                mu = logtau.mean(dim=1, keepdim=True)
+                std = logtau.std(dim=1, keepdim=True).clamp_min(1e-6)
+                logtau_z = (logtau - mu) / std
+
+                ranks = torch.argsort(torch.argsort(tau, dim=1), dim=1).float()
+                tau_rank01 = ranks / (k - 1 + 1e-8)
+
+                stagn_feat = torch.full((n, k, 1), stagn0, device=device, dtype=torch.float32)
+                prog = min(1.0, iter_frac0 + (iter_idx / max(1, int(config.max_iterations))))
+                prog_feat = torch.full((n, k, 1), float(prog), device=device, dtype=torch.float32)
+
+                base_extra = torch.cat(
+                    [
+                        logtau_z.unsqueeze(-1),
+                        tau_rank01.unsqueeze(-1),
+                        stagn_feat,
+                        prog_feat,
+                    ],
+                    dim=-1,
+                )
+                C = int(config.extra_feats)
+                if C <= base_extra.size(-1):
+                    extra = base_extra[..., :C]
+                else:
+                    pad = torch.zeros((n, k, C - base_extra.size(-1)), device=device, dtype=base_extra.dtype)
+                    extra = torch.cat([base_extra, pad], dim=-1)
+
+            if static_edge_feat is not None:
+                edge_feat = static_edge_feat
+            else:
+                if extra is None:
+                    edge_feat = torch.cat([u_emb, v_emb, dist_feat], dim=-1)
+                else:
+                    edge_feat = torch.cat([u_emb, v_emb, dist_feat, extra], dim=-1)
+
+            residual_logits_torch = config.gamma_residual * net.scorer.scorer(edge_feat).squeeze(-1)
+            residual_logits_np = residual_logits_torch.detach().cpu().numpy()
+
+            costs, flats, _, _, _ = faco.sample(
+                require_prob=False,
+                residual_logits=residual_logits_np,
+            )
+            best_idx = int(np.argmin(costs))
+            best_cost = float(costs[best_idx])
+            best_flat = flats[best_idx]
+            faco._update_pheromone_from_flat(best_flat, best_cost)
+
+    return float(faco.best_cost)
 
 
 def generate_snapshots(
@@ -1126,7 +1458,7 @@ def generate_snapshots(
         # Generate instance
         coords, distances = generate_tsp_instance(config.n_nodes, seed=config.seed + inst_idx)
         distances_t = torch.from_numpy(distances).float()
-        
+
         # Initialize FACO
         faco = MFACO_TSP(
             distances=distances_t,
@@ -1137,15 +1469,14 @@ def generate_snapshots(
             decay=config.decay,
             alpha=config.alpha,
             use_local_search=config.use_local_search,
-            use_cpp=not config.disable_heuristic,
             disable_heuristic=config.disable_heuristic,
             device="cpu",
         )
-        
+
         no_improve_count = 0
         prev_best = faco.best_cost
         snapshots_taken = 0
-        
+
         for iter_idx in range(config.max_iterations):
             # Sample and update
             costs, flats, _, _, _ = faco.sample(require_prob=False)
@@ -1153,19 +1484,20 @@ def generate_snapshots(
             best_cost = costs[best_idx]
             best_flat = flats[best_idx]
             faco._update_pheromone_from_flat(best_flat, best_cost)
-            
+
             # Track improvement
             if faco.best_cost < prev_best - 1e-8:
                 no_improve_count = 0
                 prev_best = faco.best_cost
             else:
                 no_improve_count += 1
-            
+
             # Save snapshot if conditions met
-            if (iter_idx >= config.warmup_iterations and 
-                iter_idx % config.snapshot_interval == 0 and
-                snapshots_taken < config.snapshots_per_instance):
-                
+            if (
+                iter_idx >= config.warmup_iterations
+                and iter_idx % config.snapshot_interval == 0
+                and snapshots_taken < config.snapshots_per_instance
+            ):
                 snapshot = Snapshot(
                     snapshot_id=f"inst{inst_idx:04d}_iter{iter_idx:04d}",
                     instance_id=inst_idx,
@@ -1189,18 +1521,20 @@ def generate_snapshots(
                     rho=faco.rho,
                     alpha=faco.alpha,
                 )
-                
+
                 fpath = output_path / f"{snapshot.snapshot_id}.pkl"
                 with open(fpath, 'wb') as f:
                     pickle.dump(asdict(snapshot), f)
-                
+
                 snapshots_taken += 1
                 snapshot_count += 1
-        
+
         if (inst_idx + 1) % 100 == 0:
-            logger.info(f"  Generated {inst_idx + 1}/{n_instances} instances, "
-                       f"{snapshot_count} total snapshots")
-    
+            logger.info(
+                f"  Generated {inst_idx + 1}/{n_instances} instances, "
+                f"{snapshot_count} total snapshots"
+            )
+
     logger.info(f"Done! Generated {snapshot_count} snapshots in {output_dir}")
 
 
@@ -1210,14 +1544,14 @@ def generate_snapshots(
 
 def train(config: TrainConfig):
     """Main training loop with wandb logging and periodic validation."""
-    
+
     # Set seeds
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
-    
+
     device = config.device
     logger.info(f"Training on {device}")
-    
+
     # Initialize wandb
     if config.use_wandb and WANDB_AVAILABLE:
         wandb.init(
@@ -1228,23 +1562,23 @@ def train(config: TrainConfig):
         logger.info(f"Wandb initialized: {wandb.run.name}")
     elif config.use_wandb and not WANDB_AVAILABLE:
         logger.warning("wandb requested but not installed. Install with: pip install wandb")
-    
+
     # Create directories
     Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-    
+
     # Get configuration-specific snapshot directory
     snapshot_dir = config.get_snapshot_dir()
     logger.info(f"Using snapshot directory: {snapshot_dir}")
-    
+
     # Load dataset
     dataset = SnapshotDataset(snapshot_dir, device)
     if len(dataset) == 0:
         logger.warning(f"No snapshots found in {snapshot_dir}. Generating snapshots first...")
         generate_snapshots(config, snapshot_dir)
         dataset = SnapshotDataset(snapshot_dir, device)
-    
+
     logger.info(f"Dataset: {len(dataset)} snapshots")
-    
+
     # Initialize networks
     net = Net(
         node_feats=config.node_feats,
@@ -1254,38 +1588,54 @@ def train(config: TrainConfig):
         depth=config.encoder_depth,
         scorer_hidden=config.scorer_hidden,
     ).to(device)
-    
+
     value_net = None
     if config.use_a2c:
         value_net = ValueNet(input_dim=8, hidden=64).to(device)
-    
+
     # Optimizer
     params = list(net.parameters())
     if value_net is not None:
         params += list(value_net.parameters())
     optimizer = AdamW(params, lr=config.lr, weight_decay=config.weight_decay)
-    
+
     # LR scheduler
     scheduler = CosineAnnealingLR(optimizer, T_max=config.n_epochs)
-    
-    # Baseline cache
-    fp = config_fingerprint(config)
+
+    # Baseline cache (snapshot continuation)
+    fp = baseline_cache_fingerprint(config)
     cache_file = os.path.join(config.checkpoint_dir, f"baseline_cache_{fp}.pkl")
     baseline_cache = BaselineCache(cache_file if config.use_baseline_cache else None)
-    
+
     # Training loop
     global_step = 0
     best_improvement_diff = -float('inf')
     best_val_improvement_diff = -float('inf')
-    
+
+    grad_accum_steps = int(getattr(config, "grad_accum_steps", 1) or 1)
+    if grad_accum_steps < 1:
+        raise ValueError(f"grad_accum_steps must be >= 1, got {grad_accum_steps}")
+    eff_batch = int(config.batch_size) * grad_accum_steps
+    if grad_accum_steps > 1:
+        logger.info(
+            f"Gradient accumulation enabled: grad_accum_steps={grad_accum_steps} "
+            f"(micro_batch={config.batch_size}, effective_batch={eff_batch})"
+        )
+
+    logger.info(
+        f"Paired randomness (baseline traced sampler) = {bool(config.paired_randomness)} "
+        f"(parallel_traced={bool(config.parallel_traced)})"
+    )
+
     for epoch in range(config.n_epochs):
         epoch_start = time.time()
 
         # Snapshot sampling curriculum
         if config.use_curriculum:
-            hard_weight = config.stagnation_weight_easy + \
-                (config.stagnation_weight_hard - config.stagnation_weight_easy) * \
-                min(1.0, epoch / config.curriculum_warmup_epochs)
+            hard_weight = config.stagnation_weight_easy + (
+                (config.stagnation_weight_hard - config.stagnation_weight_easy)
+                * min(1.0, epoch / config.curriculum_warmup_epochs)
+            )
         else:
             hard_weight = 0.0
 
@@ -1293,27 +1643,56 @@ def train(config: TrainConfig):
         if config.fixed_H is not None:
             H = int(config.fixed_H)
         else:
-            H = int(config.H_min + (config.H_max - config.H_min) *
-                    min(1.0, epoch / config.H_warmup_epochs))
-        
+            H = int(
+                config.H_min
+                + (config.H_max - config.H_min) * min(1.0, epoch / config.H_warmup_epochs)
+            )
+
         epoch_stats = {
             'reward_mean': [], 'improvement_diff': [], 'loss': [],
             'C_nn_mean': [], 'C_base_mean': [], 'improvement_mean': [],
             'time_total': [], 'time_baseline': [], 'time_neural': [], 'time_backward': [],
             'throughput': [], 'policy_loss': [], 'value_loss': [], 'entropy_mean': [],
         }
-        
-        n_batches = max(1, len(dataset) // config.batch_size)
-        
-        for batch_idx in range(n_batches):
-            # Sample batch
+
+        # Each epoch samples only `epoch_size` snapshots (with replacement) from the dataset.
+        # This makes epoch length independent of dataset size.
+        epoch_size = int(config.epoch_size) if config.epoch_size is not None else int(len(dataset))
+        if epoch_size < 1:
+            raise ValueError(f"epoch_size must be >= 1, got {epoch_size}")
+
+        n_microbatches = max(1, epoch_size // int(config.batch_size))
+        dropped = epoch_size - (n_microbatches * int(config.batch_size))
+        if dropped > 0:
+            logger.info(
+                f"Epoch {epoch+1}: epoch_size={epoch_size} not divisible by batch_size={config.batch_size}; "
+                f"dropping {dropped} samples to keep exactly {n_microbatches} micro-batches"
+            )
+
+        optimizer.zero_grad(set_to_none=True)
+        accum_count = 0
+        accum_target = grad_accum_steps
+        accum_snapshots = 0
+        accum_forward_time = 0.0
+        accum_baseline_time = 0.0
+        accum_neural_time = 0.0
+        accum_loss_time = 0.0
+        accum_backward_time = 0.0
+        accum_sums: Dict[str, float] = {}
+
+        for micro_idx in range(n_microbatches):
+            # Start a new accumulation group
+            if accum_count == 0:
+                remaining = n_microbatches - micro_idx
+                accum_target = min(grad_accum_steps, remaining)
+
+            # Sample micro-batch
             if config.use_curriculum:
                 batch_ids = dataset.sample_batch(config.batch_size, hard_weight)
             else:
                 batch_ids = list(np.random.choice(dataset.snapshot_ids, size=config.batch_size, replace=True))
-            
-            # Training step
-            stats = train_step(
+
+            loss, mb_stats = compute_batch_loss_and_stats(
                 batch_ids=batch_ids,
                 dataset=dataset,
                 net=net,
@@ -1321,57 +1700,105 @@ def train(config: TrainConfig):
                 baseline_cache=baseline_cache,
                 H=H,
                 config=config,
-                optimizer=optimizer,
             )
-            
+
+            # Scale to match the effective batch gradient
+            (loss / float(accum_target)).backward()
+
             # Accumulate stats
-            for k in epoch_stats:
-                if k in stats:
-                    epoch_stats[k].append(stats[k])
-            
-            global_step += 1
-            
-            # Log periodically
-            if global_step % config.log_interval == 0:
-                logger.info(
-                    f"Epoch {epoch+1} | Step {global_step} | "
-                    f"H={H} | "
-                    f"R={stats['reward_mean']:.4f} | "
-                    f"ImpDiff={stats['improvement_diff']:+.3f}% | "
-                    f"Loss={stats['loss']:.4f} | "
-                    f"Time={stats['time_total']:.2f}s"
-                )
-                
-                # Log to wandb (step-level)
-                if config.use_wandb and WANDB_AVAILABLE:
-                    wandb.log({
-                        'train/step': global_step,
-                        'train/reward': stats['reward_mean'],
-                        'train/improvement_diff': stats['improvement_diff'],
-                        'train/loss': stats['loss'],
-                        'train/policy_loss': stats['policy_loss'],
-                        'train/value_loss': stats['value_loss'],
-                        'train/entropy': stats['entropy_mean'],
-                        'train/C_nn': stats['C_nn_mean'],
-                        'train/C_base': stats['C_base_mean'],
-                        'train/improvement': stats['improvement_mean'],
-                        'timing/step_total': stats['time_total'],
-                        'timing/baseline': stats['time_baseline'],
-                        'timing/neural': stats['time_neural'],
-                        'timing/backward': stats['time_backward'],
-                        'timing/throughput': stats['throughput'],
-                        'schedule/H': H,
-                        'schedule/hard_weight': hard_weight,
-                        'schedule/lr': scheduler.get_last_lr()[0],
-                    }, step=global_step)
-        
-        # End of epoch
+            accum_count += 1
+            accum_snapshots += len(batch_ids)
+            accum_forward_time += float(mb_stats.get('time_total', 0.0))
+            accum_baseline_time += float(mb_stats.get('time_baseline', 0.0))
+            accum_neural_time += float(mb_stats.get('time_neural', 0.0))
+            accum_loss_time += float(mb_stats.get('time_loss', 0.0))
+            for k, v in mb_stats.items():
+                if isinstance(v, (int, float)):
+                    accum_sums[k] = accum_sums.get(k, 0.0) + float(v)
+
+            # If group complete, apply optimizer update
+            if accum_count >= accum_target:
+                t0 = time.time()
+                torch.nn.utils.clip_grad_norm_(net.parameters(), config.max_grad_norm)
+                if value_net is not None:
+                    torch.nn.utils.clip_grad_norm_(value_net.parameters(), config.max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                accum_backward_time = time.time() - t0
+
+                global_step += 1
+
+                # Aggregate stats over the accumulation group
+                stats: Dict[str, float] = {}
+                for k, s in accum_sums.items():
+                    if k == 'throughput':
+                        continue
+                    stats[k] = s / float(accum_target)
+
+                stats['time_backward'] = float(accum_backward_time)
+                stats['time_total'] = float(accum_forward_time + accum_backward_time)
+                stats['time_baseline'] = float(accum_baseline_time)
+                stats['time_neural'] = float(accum_neural_time)
+                stats['time_loss'] = float(accum_loss_time)
+                stats['throughput'] = float(accum_snapshots) / max(stats['time_total'], 1e-9)
+
+                for k in epoch_stats:
+                    if k in stats:
+                        epoch_stats[k].append(stats[k])
+
+                if global_step % config.log_interval == 0:
+                    logger.info(
+                        f"Epoch {epoch+1} | Step {global_step} | "
+                        f"H={H} | "
+                        f"R={stats.get('reward_mean', 0.0):.4f} | "
+                        f"ImpDiff={stats.get('improvement_diff', 0.0):+.3f}% | "
+                        f"Loss={stats.get('loss', 0.0):.4f} | "
+                        f"Time={stats.get('time_total', 0.0):.2f}s | "
+                        f"EffB={eff_batch}"
+                    )
+
+                    if config.use_wandb and WANDB_AVAILABLE:
+                        wandb.log(
+                            {
+                                'train/step': global_step,
+                                'train/reward': stats.get('reward_mean', 0.0),
+                                'train/improvement_diff': stats.get('improvement_diff', 0.0),
+                                'train/loss': stats.get('loss', 0.0),
+                                'train/policy_loss': stats.get('policy_loss', 0.0),
+                                'train/value_loss': stats.get('value_loss', 0.0),
+                                'train/entropy': stats.get('entropy_mean', 0.0),
+                                'train/C_nn': stats.get('C_nn_mean', 0.0),
+                                'train/C_base': stats.get('C_base_mean', 0.0),
+                                'train/improvement': stats.get('improvement_mean', 0.0),
+                                'timing/step_total': stats.get('time_total', 0.0),
+                                'timing/baseline': stats.get('time_baseline', 0.0),
+                                'timing/neural': stats.get('time_neural', 0.0),
+                                'timing/backward': stats.get('time_backward', 0.0),
+                                'timing/throughput': stats.get('throughput', 0.0),
+                                'schedule/H': H,
+                                'schedule/hard_weight': hard_weight,
+                                'schedule/lr': scheduler.get_last_lr()[0],
+                                'train/grad_accum_steps': grad_accum_steps,
+                                'train/effective_batch': eff_batch,
+                            },
+                            step=global_step,
+                        )
+
+                # Reset accumulators
+                accum_count = 0
+                accum_snapshots = 0
+                accum_forward_time = 0.0
+                accum_baseline_time = 0.0
+                accum_neural_time = 0.0
+                accum_loss_time = 0.0
+                accum_backward_time = 0.0
+                accum_sums = {}
+
         scheduler.step()
-        
-        # Average stats
+
         avg_stats = {k: np.mean(v) if v else 0.0 for k, v in epoch_stats.items()}
         epoch_time = time.time() - epoch_start
-        
+
         logger.info(
             f"\n=== Epoch {epoch+1}/{config.n_epochs} Summary ===\n"
             f"  Time: {epoch_time:.1f}s | H: {H} | Hard%: {hard_weight:.0%}\n"
@@ -1381,15 +1808,13 @@ def train(config: TrainConfig):
             f"  Improvement: {avg_stats['improvement_mean']:.4f}\n"
             f"  Avg Step Time: {avg_stats['time_total']:.2f}s | Throughput: {avg_stats['throughput']:.1f} snap/s\n"
         )
-        
-        # Run validation periodically
+
         val_stats = None
         if (epoch + 1) % config.val_interval == 0:
             logger.info("Running validation...")
             val_start = time.time()
-            val_stats = validate(net, config, n_instances=config.val_instances, H=H)
+            val_stats = validate(net, config, n_instances=config.val_instances)
             val_time = time.time() - val_start
-            
             logger.info(
                 f"  Validation ({config.val_instances} instances, {val_time:.1f}s):\n"
                 f"    Improvement Diff: {val_stats['improvement_diff']:+.3f}%\n"
@@ -1397,11 +1822,9 @@ def train(config: TrainConfig):
                 f"    Baseline Cost: {val_stats['baseline_cost_mean']:.4f}\n"
                 f"    Improvement: {val_stats['improvement_mean']:.4f}\n"
             )
-            
             if val_stats['improvement_diff'] > best_val_improvement_diff:
                 best_val_improvement_diff = val_stats['improvement_diff']
-        
-        # Log epoch-level metrics to wandb
+
         if config.use_wandb and WANDB_AVAILABLE:
             epoch_log = {
                 'epoch': epoch + 1,
@@ -1415,47 +1838,48 @@ def train(config: TrainConfig):
                 'epoch/throughput': avg_stats['throughput'],
             }
             if val_stats is not None:
-                epoch_log.update({
-                    'val/improvement_diff': val_stats['improvement_diff'],
-                    'val/neural_cost': val_stats['neural_cost_mean'],
-                    'val/baseline_cost': val_stats['baseline_cost_mean'],
-                    'val/improvement': val_stats['improvement_mean'],
-                    'val/best_improvement_diff': best_val_improvement_diff,
-                })
+                epoch_log.update(
+                    {
+                        'val/improvement_diff': val_stats['improvement_diff'],
+                        'val/neural_cost': val_stats['neural_cost_mean'],
+                        'val/baseline_cost': val_stats['baseline_cost_mean'],
+                        'val/improvement': val_stats['improvement_mean'],
+                        'val/best_improvement_diff': best_val_improvement_diff,
+                    }
+                )
             wandb.log(epoch_log, step=global_step)
-        
-        # Save checkpoint
+
         if (epoch + 1) % config.save_interval == 0 or avg_stats['improvement_diff'] > best_improvement_diff:
             if avg_stats['improvement_diff'] > best_improvement_diff:
                 best_improvement_diff = avg_stats['improvement_diff']
-                ckpt_name = f"best_model.pt"
+                ckpt_name = "best_model.pt"
             else:
                 ckpt_name = f"epoch_{epoch+1}.pt"
-            
+
             ckpt_path = os.path.join(config.checkpoint_dir, ckpt_name)
-            torch.save({
-                'epoch': epoch + 1,
-                'net_state_dict': net.state_dict(),
-                'value_net_state_dict': value_net.state_dict() if value_net else None,
-                'optimizer_state_dict': optimizer.state_dict(),
-                'config': asdict(config),
-                'best_improvement_diff': best_improvement_diff,
-                'best_val_improvement_diff': best_val_improvement_diff,
-            }, ckpt_path)
+            torch.save(
+                {
+                    'epoch': epoch + 1,
+                    'net_state_dict': net.state_dict(),
+                    'value_net_state_dict': value_net.state_dict() if value_net else None,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'config': asdict(config),
+                    'best_improvement_diff': best_improvement_diff,
+                    'best_val_improvement_diff': best_val_improvement_diff,
+                },
+                ckpt_path,
+            )
             logger.info(f"Saved checkpoint: {ckpt_path}")
-        
-        # Save baseline cache periodically
+
         if config.use_baseline_cache and (epoch + 1) % 10 == 0:
             baseline_cache.save()
-    
-    # Final save
+
     if config.use_baseline_cache:
         baseline_cache.save()
-    
-    # Finish wandb run
+
     if config.use_wandb and WANDB_AVAILABLE:
         wandb.finish()
-    
+
     logger.info("Training complete!")
 
 
@@ -1467,94 +1891,73 @@ def validate(
     net: Net,
     config: TrainConfig,
     n_instances: int = 20,
-    H: int = 50,
+    dataset: str = "val",
 ) -> Dict[str, float]:
-    """
-    Validate neural policy against baseline on fresh instances.
+    """Evaluate on a fixed dataset (`valDataset-{n}.pt` or `testDataset-{n}.pt`).
+
+    Runs full FACO for `config.max_iterations` iterations for both:
+    - baseline FACO (cached)
+    - neural-guided FACO
     """
     device = config.device
     net.eval()
-    
-    neural_costs = []
-    baseline_costs = []
-    improvements = []
-    
-    for i in range(n_instances):
-        # Generate instance
-        coords, distances = generate_tsp_instance(config.n_nodes, seed=10000 + i)
-        distances_t = torch.from_numpy(distances).float()
-        
-        # Run baseline FACO to get a snapshot
-        faco = MFACO_TSP(
-            distances=distances_t,
-            n_ants=config.n_ants,
-            cand_list_size=config.cand_list_size,
-            backup_list_size=config.backup_list_size,
-            min_new_edges=config.min_new_edges,
-            decay=config.decay,
-            alpha=config.alpha,
-            use_local_search=config.use_local_search,
-            use_cpp=not config.disable_heuristic,
-            disable_heuristic=config.disable_heuristic,
-            device="cpu",
-        )
-        
-        # Warmup
-        for _ in range(config.warmup_iterations):
-            costs, flats, _, _, _ = faco.sample(require_prob=False)
-            best_idx = int(np.argmin(costs))
-            faco._update_pheromone_from_flat(flats[best_idx], costs[best_idx])
-        
-        # Create snapshot
-        snapshot = Snapshot(
-            snapshot_id=f"val_{i}",
-            instance_id=i,
-            coords=coords,
-            distances=distances,
-            pheromone_sparse=faco.pheromone_sparse_np.copy(),
-            source_route=faco.source_route.copy(),
-            source_cost=faco.source_cost,
-            best_route=faco.best_route.copy(),
-            best_cost=faco.best_cost,
-            nn_list=faco.nn_list.copy(),
-            backup_list=faco.backup_list.copy(),
-            iteration=config.warmup_iterations,
-            no_improve_count=0,
-            tau_min=faco.tau_min,
-            tau_max=faco.tau_max,
-            n_ants=faco.n_ants,
-            k=faco.k,
-            bl=faco.bl,
-            min_new_edges=faco.min_new_edges,
-            rho=faco.rho,
-            alpha=faco.alpha,
-        )
-        
-        # Run baseline continuation
-        c_base = run_baseline_continuation(snapshot, H, seed=i, config=config)
-        
-        # Run neural continuation (with no_grad since this is inference)
-        # Temporarily enable no_grad mode for the whole forward pass
-        net.eval()
-        with torch.no_grad():
-            # For inference, we need a modified version that doesn't track gradients
-            result = run_neural_continuation(snapshot, net, H, seed=i, config=config,
-                                            gamma=config.gamma_residual)
-        
-        neural_costs.append(result.best_cost)
-        baseline_costs.append(c_base)
-        improvements.append(c_base - result.best_cost)
-    
-    # Compute improvement_diff: neural improvement% - baseline improvement%
-    # Neural improvement % relative to baseline continuation cost
-    neural_improvements_pct = [(baseline_costs[i] - neural_costs[i]) / baseline_costs[i] * 100 for i in range(n_instances)]
-    improvement_diff = np.mean(neural_improvements_pct)
-    
+
+    if dataset == "val":
+        dataset_path = _default_val_dataset_path(config.n_nodes)
+    elif dataset == "test":
+        dataset_path = _default_test_dataset_path(config.n_nodes)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset} (expected 'val' or 'test')")
+
+    logger.info(f"Full-run eval: dataset={dataset} path={dataset_path}")
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+
+    coords_tensor = torch.load(str(dataset_path), map_location="cpu")
+    if isinstance(coords_tensor, (list, tuple)):
+        coords_list = [c.detach().cpu() for c in coords_tensor]
+    else:
+        coords_list = [coords_tensor[i].detach().cpu() for i in range(int(coords_tensor.size(0)))]
+
+    dataset_id = dataset_path.name
+    fp = config_fingerprint(config)
+    cache_file = os.path.join(config.checkpoint_dir, f"baseline_fullrun_{fp}_{dataset_id}.pkl")
+    Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    baseline_cache = FullRunBaselineCache(cache_file)
+
+    n_total = min(int(n_instances), len(coords_list))
+    neural_costs: List[float] = []
+    baseline_costs: List[float] = []
+    improvements: List[float] = []
+
+    for i in range(n_total):
+        coords = coords_list[i]
+        seed = stable_hash((dataset_id, i, config.seed, config.max_iterations))
+
+        c_base = baseline_cache.get(dataset_id, i, int(config.max_iterations), seed)
+        if c_base is None:
+            c_base = run_baseline_fullrun(coords=coords, config=config, seed=seed)
+            baseline_cache.set(dataset_id, i, int(config.max_iterations), seed, c_base)
+
+        c_nn = run_neural_fullrun(coords=coords.to(device), net=net, config=config, seed=seed)
+
+        baseline_costs.append(float(c_base))
+        neural_costs.append(float(c_nn))
+        improvements.append(float(c_base - c_nn))
+
+    baseline_cache.save()
+
+    neural_improvements_pct = [
+        (baseline_costs[i] - neural_costs[i]) / (baseline_costs[i] + 1e-8) * 100
+        for i in range(n_total)
+    ]
+    improvement_diff = float(np.mean(neural_improvements_pct))
+
     return {
-        'neural_cost_mean': np.mean(neural_costs),
-        'baseline_cost_mean': np.mean(baseline_costs),
-        'improvement_mean': np.mean(improvements),
-        'improvement_diff': improvement_diff,
+        'neural_cost_mean': float(np.mean(neural_costs)),
+        'baseline_cost_mean': float(np.mean(baseline_costs)),
+        'improvement_mean': float(np.mean(improvements)),
+        'improvement_diff': float(improvement_diff),
     }
 
 
@@ -1565,22 +1968,34 @@ def validate(
 def main():
     parser = argparse.ArgumentParser(description="Train Neural Residual FACO")
     parser.add_argument('--mode', type=str, default='train',
-                       choices=['train', 'generate', 'validate'],
-                       help='Mode: train, generate snapshots, or validate')
+                       choices=['train', 'generate', 'validate', 'test'],
+                       help='Mode: train, generate snapshots, validate on valDataset, or test on testDataset')
     parser.add_argument('--config', type=str, default=None,
                        help='Path to config JSON file')
     parser.add_argument('--checkpoint', type=str, default=None,
-                       help='Path to checkpoint for resume/validate')
+                       help='Path to checkpoint for resume/validate/test')
     
     # Override config options
     parser.add_argument('--n_nodes', type=int, default=None)
     parser.add_argument('--n_instances', type=int, default=None)
+    parser.add_argument('--max_iterations', type=int, default=None,
+                       help='Override max_iterations (used for snapshot generation and full-run validation)')
     parser.add_argument('--batch_size', type=int, default=None)
+    parser.add_argument('--epoch_size', type=int, default=None,
+                       help='Number of snapshot samples per epoch (micro-batches = epoch_size // batch_size). Defaults to full dataset size.')
+    parser.add_argument('--grad_accum_steps', type=int, default=None,
+                       help='Gradient accumulation steps (effective_batch = batch_size * grad_accum_steps)')
     parser.add_argument('--n_epochs', type=int, default=None)
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--snapshot_dir', type=str, default=None)
     parser.add_argument('--checkpoint_dir', type=str, default=None)
+
+    # Ablations / model shape
+    parser.add_argument('--extra_feats', type=int, default=None,
+                       help='Override extra_feats (context feature dim) in the residual scorer. Use 0 to disable.')
+    parser.add_argument('--no_extra_feats', action='store_true',
+                       help='Ablation: disable extra context features (sets extra_feats=0).')
 
     # Curriculum / horizon overrides
     parser.add_argument('--no_curriculum', action='store_true',
@@ -1592,6 +2007,12 @@ def main():
 
     parser.add_argument('--disable_heuristic', action='store_true',
                        help='Disable heuristic matrix (eta=1): ants use pheromone + residual only')
+
+    # Paired-randomness ablation
+    parser.add_argument('--paired_randomness', action='store_true', default=None,
+                       help='Use traced/paired sampler for baseline continuations (lower variance, slower)')
+    parser.add_argument('--no_paired_randomness', action='store_true',
+                       help='Ablation: baseline uses fast non-traced sampler (not paired; higher variance, faster)')
     
     # Wandb options
     parser.add_argument('--use_wandb', action='store_true', default=None,
@@ -1620,12 +2041,15 @@ def main():
         config = TrainConfig()
     
     # Override with CLI args
-    for key in ['n_nodes', 'n_instances', 'batch_size', 'n_epochs', 'lr', 
+    for key in ['n_nodes', 'n_instances', 'max_iterations', 'batch_size', 'epoch_size', 'grad_accum_steps', 'n_epochs', 'lr',
                 'device', 'snapshot_dir', 'checkpoint_dir', 'wandb_project',
-                'wandb_run_name', 'val_interval', 'val_instances']:
+                'wandb_run_name', 'val_interval', 'val_instances', 'extra_feats']:
         val = getattr(args, key)
         if val is not None:
             setattr(config, key, val)
+
+    if args.no_extra_feats:
+        config.extra_feats = 0
     
     # Handle --use_wandb / --no_wandb flags
     if args.no_wandb:
@@ -1638,6 +2062,12 @@ def main():
         config.use_curriculum = False
     elif args.use_curriculum:
         config.use_curriculum = True
+
+    # Handle paired randomness flags
+    if args.no_paired_randomness:
+        config.paired_randomness = False
+    elif args.paired_randomness:
+        config.paired_randomness = True
 
     if args.H is not None:
         config.fixed_H = int(args.H)
@@ -1658,7 +2088,19 @@ def main():
             raise ValueError("Must provide --checkpoint for validation")
         
         # Load checkpoint
-        ckpt = torch.load(args.checkpoint, map_location=config.device)
+        try:
+            # PyTorch 2.6+ defaults weights_only=True; our checkpoints store non-tensor metadata.
+            ckpt = torch.load(args.checkpoint, map_location=config.device, weights_only=False)
+        except TypeError:
+            # Older PyTorch does not support weights_only
+            ckpt = torch.load(args.checkpoint, map_location=config.device)
+
+        # Infer extra_feats from checkpoint unless explicitly overridden
+        ckpt_cfg = ckpt.get('config') if isinstance(ckpt, dict) else None
+        if isinstance(ckpt_cfg, dict):
+            if args.extra_feats is None and (not args.no_extra_feats):
+                if 'extra_feats' in ckpt_cfg:
+                    config.extra_feats = int(ckpt_cfg['extra_feats'])
         
         net = Net(
             node_feats=config.node_feats,
@@ -1670,8 +2112,40 @@ def main():
         ).to(config.device)
         net.load_state_dict(ckpt['net_state_dict'])
         
-        stats = validate(net, config)
+        stats = validate(net, config, n_instances=config.val_instances, dataset="val")
         logger.info(f"\nValidation Results:")
+        for k, v in stats.items():
+            logger.info(f"  {k}: {v:.4f}")
+
+    elif args.mode == 'test':
+        if args.checkpoint is None:
+            raise ValueError("Must provide --checkpoint for test")
+
+        # Load checkpoint
+        try:
+            ckpt = torch.load(args.checkpoint, map_location=config.device, weights_only=False)
+        except TypeError:
+            ckpt = torch.load(args.checkpoint, map_location=config.device)
+
+        # Infer extra_feats from checkpoint unless explicitly overridden
+        ckpt_cfg = ckpt.get('config') if isinstance(ckpt, dict) else None
+        if isinstance(ckpt_cfg, dict):
+            if args.extra_feats is None and (not args.no_extra_feats):
+                if 'extra_feats' in ckpt_cfg:
+                    config.extra_feats = int(ckpt_cfg['extra_feats'])
+
+        net = Net(
+            node_feats=config.node_feats,
+            edge_feats=config.edge_feats,
+            extra_feats=config.extra_feats,
+            units=config.units,
+            depth=config.encoder_depth,
+            scorer_hidden=config.scorer_hidden,
+        ).to(config.device)
+        net.load_state_dict(ckpt['net_state_dict'])
+
+        stats = validate(net, config, n_instances=config.val_instances, dataset="test")
+        logger.info(f"\nTest Results:")
         for k, v in stats.items():
             logger.info(f"  {k}: {v:.4f}")
 

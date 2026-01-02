@@ -164,14 +164,6 @@ class MFACO_TSP:
         self.device = device
         self.disable_heuristic = bool(disable_heuristic)
 
-        # C++ backend currently bakes heuristic into sampling (eta=1/dist).
-        # If heuristic is disabled, force Python backend to ensure correctness.
-        if self.disable_heuristic and use_cpp and HAS_CPP_BACKEND:
-            warnings.warn(
-                "disable_heuristic=True forces Python backend; C++ backend does not support disabling heuristic yet."
-            )
-            use_cpp = False
-
         self._use_cpp = use_cpp and HAS_CPP_BACKEND
         
         # Convert distances to numpy for C++ backend
@@ -195,6 +187,7 @@ class MFACO_TSP:
                 p_best,
                 use_local_search,
                 random_mode,
+                self.disable_heuristic,
                 "cpu"
             )
             self._py = None
