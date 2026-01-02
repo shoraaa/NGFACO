@@ -20,4 +20,4 @@ uv.lock
 wandb
 snapshots
 checkpoints
-checkpoints_
+uv.lock
