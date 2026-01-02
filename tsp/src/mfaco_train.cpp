@@ -24,7 +24,8 @@ MFACO_TSP::MFACO_TSP(
     float alpha_,
     float p_best_,
     bool use_local_search_,
-    bool random_mode_
+    bool random_mode_,
+    bool disable_heuristic_
 ) : n(n_),
     n_ants(n_ants_),
     k(std::min(cand_list_size, n_ - 1)),
@@ -34,7 +35,8 @@ MFACO_TSP::MFACO_TSP(
     alpha(alpha_),
     p_best(p_best_),
     use_local_search(use_local_search_),
-    random_mode(random_mode_)
+    random_mode(random_mode_),
+    disable_heuristic(disable_heuristic_)
 {
     // Copy distances
     distances.assign(dist_ptr, dist_ptr + n * n);
@@ -370,6 +372,10 @@ void MFACO_TSP::build_nn_pos() {
 
 void MFACO_TSP::build_heuristic() {
     heuristic_sparse.resize(n * k);
+    if (disable_heuristic) {
+        std::fill(heuristic_sparse.begin(), heuristic_sparse.end(), 1.0f);
+        return;
+    }
     for (int32_t u = 0; u < n; ++u) {
         for (int32_t j = 0; j < k; ++j) {
             int32_t v = nn_list[u * k + j];
@@ -451,6 +457,7 @@ std::pair<float, float> MFACO_TSP::calc_trail_limits_cl(float solution_cost) con
 
 void MFACO_TSP::compute_probmat(const float* residual_logits, std::vector<float>& probmat) {
     // probmat = tau^alpha * eta * exp(residual)
+    // When disable_heuristic=true, eta is pre-set to 1.0 in heuristic_sparse.
     for (int32_t u = 0; u < n; ++u) {
         for (int32_t j = 0; j < k; ++j) {
             int32_t idx = u * k + j;

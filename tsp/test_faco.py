@@ -66,7 +66,7 @@ class TestConfig:
     verbose: bool = True
 
     # C++ backend threading (OpenMP)
-    faco_cpp_threads: Optional[int] = None
+    faco_cpp_threads: Optional[int] = 16
 
 
 def _infer_n_and_count(instances: Optional[List[Dict[str, Any]]], fallback_n: int, fallback_count: int) -> tuple[int | str, int]:

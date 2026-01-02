@@ -81,7 +81,7 @@ class TrainConfig:
     """Training configuration with all hyperparameters."""
     
     # Instance generation
-    n_nodes: int = 100
+    n_nodes: int = 500
     n_instances: int = 1000
     
     # Snapshot generation
@@ -91,7 +91,7 @@ class TrainConfig:
     snapshots_per_instance: int = 10  # max snapshots per instance
     
     # Training
-    batch_size: int = 128
+    batch_size: int = 32
     n_epochs: int = 15
     lr: float = 1e-4
     weight_decay: float = 1e-5
@@ -106,10 +106,10 @@ class TrainConfig:
     H_warmup_epochs: int = 20         # used only when fixed_H is None
     
     # Residual policy
-    gamma_residual: float = 0.2       # scale for residual logits
+    gamma_residual: float = 0.5       # scale for residual logits
     
     # REINFORCE / A2C
-    use_a2c: bool = True
+    use_a2c: bool = False
     entropy_coeff: float = 0.003
     value_coeff: float = 0.5
     normalize_advantage: bool = True
@@ -119,7 +119,7 @@ class TrainConfig:
     use_curriculum: bool = True
     stagnation_weight_easy: float = 0.2
     stagnation_weight_hard: float = 0.8
-    curriculum_warmup_epochs: int = 5
+    curriculum_warmup_epochs: int = 20
     
     # FACO parameters
     n_ants: int = 32
@@ -129,6 +129,7 @@ class TrainConfig:
     decay: float = 0.9
     alpha: float = 1.0
     use_local_search: bool = True
+    disable_heuristic: bool = True      # if True, ants use pheromone + residual only (eta=1)
 
     # Parallelism (C++ backend)
     # NOTE: Traced sampling (`require_prob=True`) is typically dominated by Python replay,
@@ -452,7 +453,7 @@ def config_fingerprint(config: TrainConfig) -> str:
     # keep only fields that affect baseline continuation outcome
     keep = {
         "n_nodes","n_ants","cand_list_size","backup_list_size","min_new_edges",
-        "decay","alpha","use_local_search",
+        "decay","alpha","use_local_search","disable_heuristic",
     }
     d = {k: d[k] for k in keep}
     s = json.dumps(d, sort_keys=True)
@@ -554,6 +555,8 @@ def restore_faco_from_snapshot(snapshot: Snapshot, config: TrainConfig,
         use_local_search=config.use_local_search,
         enable_torch_sync=True,
         device=device,
+        use_cpp=not config.disable_heuristic,
+        disable_heuristic=config.disable_heuristic,
     )
 
 
@@ -775,9 +778,11 @@ def run_neural_continuation(
     n, k = faco.n, faco.k
 
     # Precompute static distance feature (n,k,1) on device.
-    # If your heuristic is exactly h = 1/(dist+eps), then dist ≈ 1/h.
-    # This is fast and avoids building full (n,n) dist on GPU.
-    dist_nk = faco.h_sparse_torch.clamp_min(1e-12).reciprocal().clamp_max(1e6)  # (n,k)
+    # Do NOT derive it from heuristic, because heuristic can be disabled.
+    u_idx = np.arange(n)[:, None]
+    v_idx = faco.nn_list
+    dist_nk_np = faco.dist_np32[u_idx, v_idx].astype(np.float32)  # (n,k)
+    dist_nk = torch.from_numpy(dist_nk_np).to(device=device, dtype=torch.float32)
     dist_feat = dist_nk.unsqueeze(-1)  # (n,k,1)
 
     # Static context scalars (you can make these dynamic if MFACO exposes no_improve_count)
@@ -945,7 +950,7 @@ def compute_loss(
         # REINFORCE: use normalized rewards as advantages
         values = None
         value_loss = torch.zeros((), device=device)
-        advantages = rewards_per_ant
+        advantages = rewards_per_ant - rewards_per_ant.mean()  # (B,A)
     
     # Normalize advantages
     if config.normalize_advantage and batch_size > 1:
@@ -1132,6 +1137,8 @@ def generate_snapshots(
             decay=config.decay,
             alpha=config.alpha,
             use_local_search=config.use_local_search,
+            use_cpp=not config.disable_heuristic,
+            disable_heuristic=config.disable_heuristic,
             device="cpu",
         )
         
@@ -1487,6 +1494,8 @@ def validate(
             decay=config.decay,
             alpha=config.alpha,
             use_local_search=config.use_local_search,
+            use_cpp=not config.disable_heuristic,
+            disable_heuristic=config.disable_heuristic,
             device="cpu",
         )
         
@@ -1580,6 +1589,9 @@ def main():
                        help='Enable curriculum snapshot sampling')
     parser.add_argument('--H', type=int, default=None,
                        help='Fix continuation horizon H (disables H schedule)')
+
+    parser.add_argument('--disable_heuristic', action='store_true',
+                       help='Disable heuristic matrix (eta=1): ants use pheromone + residual only')
     
     # Wandb options
     parser.add_argument('--use_wandb', action='store_true', default=None,
@@ -1629,6 +1641,9 @@ def main():
 
     if args.H is not None:
         config.fixed_H = int(args.H)
+
+    if args.disable_heuristic:
+        config.disable_heuristic = True
     
     if args.mode == 'generate':
         snapshot_dir = config.get_snapshot_dir()

@@ -140,6 +140,7 @@ public:
         float p_best = 0.05f,
         bool use_local_search = true,
         bool random_mode = false,
+        bool disable_heuristic = false,
         const std::string& device = "cpu"  // ignored for now, C++ is CPU-only
     ) {
         auto buf = distances.request();
@@ -153,7 +154,7 @@ public:
             dist_ptr, n, n_ants,
             cand_list_size, backup_list_size, min_new_edges,
             decay, alpha, p_best,
-            use_local_search, random_mode
+            use_local_search, random_mode, disable_heuristic
         );
     }
 
@@ -420,7 +421,7 @@ PYBIND11_MODULE(faco_cpp, m) {
     py::class_<PyMFACO_TSP>(m, "MFACO_TSP")
         .def(py::init<
             py::array_t<float, py::array::c_style | py::array::forcecast>,
-            int32_t, int32_t, int32_t, int32_t, float, float, float, bool, bool, const std::string&
+            int32_t, int32_t, int32_t, int32_t, float, float, float, bool, bool, bool, const std::string&
         >(),
             py::arg("distances"),
             py::arg("n_ants"),
@@ -432,6 +433,7 @@ PYBIND11_MODULE(faco_cpp, m) {
             py::arg("p_best") = 0.05f,
             py::arg("use_local_search") = true,
             py::arg("random_mode") = false,
+            py::arg("disable_heuristic") = false,
             py::arg("device") = "cpu"
         )
         // Properties

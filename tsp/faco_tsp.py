@@ -688,6 +688,7 @@ class MFACO_TSP:
         use_local_search: bool = True,
         random_mode: bool = False,           # if True, use uniform random selection instead of roulette
         enable_torch_sync: bool = True,      # if False, skip sync_pheromone_to_torch (faster baseline)
+        disable_heuristic: bool = False,     # if True, ignore heuristic (eta=1) and use pheromone * exp(residual)
         device: str = "cuda",
     ):
         self.device = device
@@ -707,6 +708,7 @@ class MFACO_TSP:
         self.use_local_search = bool(use_local_search)
         self.random_mode = bool(random_mode)
         self.enable_torch_sync = bool(enable_torch_sync)
+        self.disable_heuristic = bool(disable_heuristic)
 
         # Precompute NN and backup lists on CPU (stable, deterministic)
         dist_np = self.distances.detach().cpu().numpy()
@@ -818,14 +820,14 @@ class MFACO_TSP:
         """
         tau = self.pheromone_sparse.clamp_min(1e-10) ** self.alpha
 
-        # Use cached heuristic (matches numpy heuristic_sparse_np exactly)
-        h = self.h_sparse_torch
-
-        # Apply invtemp to heuristic only (matches numpy sampling)
-        if invtemp != 1.0:
-            h = h ** float(invtemp)
-        
-        w = tau * h
+        # Heuristic: either cached eta (default) or eta=1 if disabled
+        if self.disable_heuristic:
+            w = tau
+        else:
+            h = self.h_sparse_torch
+            if invtemp != 1.0:
+                h = h ** float(invtemp)
+            w = tau * h
         w = w.clamp_min(1e-12)
         
         # Apply neural residual if provided (additive in log-space)
@@ -860,8 +862,11 @@ class MFACO_TSP:
         Returns:
             probmat_sparse: (n, k) unnormalized weights for candidate edges
         """
-        # Base: tau^alpha * eta^beta
-        probmat_sparse = (self.pheromone_sparse_np ** self.alpha) * (self.heuristic_sparse_np ** invtemp)
+        # Base: tau^alpha * eta^beta (or eta=1 if disabled)
+        if self.disable_heuristic:
+            probmat_sparse = (self.pheromone_sparse_np ** self.alpha)
+        else:
+            probmat_sparse = (self.pheromone_sparse_np ** self.alpha) * (self.heuristic_sparse_np ** invtemp)
         
         # Apply neural residual if provided
         if residual_logits is not None:

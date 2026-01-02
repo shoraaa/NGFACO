@@ -140,6 +140,7 @@ class MFACO_TSP:
         enable_torch_sync: bool = True,
         device: str = "cuda",
         use_cpp: bool = True,  # New option to force Python backend
+        disable_heuristic: bool = False,
     ):
         """
         Initialize MFACO_TSP solver.
@@ -161,6 +162,16 @@ class MFACO_TSP:
             use_cpp: if False, force Python backend even if C++ available
         """
         self.device = device
+        self.disable_heuristic = bool(disable_heuristic)
+
+        # C++ backend currently bakes heuristic into sampling (eta=1/dist).
+        # If heuristic is disabled, force Python backend to ensure correctness.
+        if self.disable_heuristic and use_cpp and HAS_CPP_BACKEND:
+            warnings.warn(
+                "disable_heuristic=True forces Python backend; C++ backend does not support disabling heuristic yet."
+            )
+            use_cpp = False
+
         self._use_cpp = use_cpp and HAS_CPP_BACKEND
         
         # Convert distances to numpy for C++ backend
@@ -210,6 +221,7 @@ class MFACO_TSP:
                 use_local_search,
                 random_mode,
                 enable_torch_sync,
+                disable_heuristic,
                 device
             )
     
@@ -221,6 +233,7 @@ class MFACO_TSP:
         enable_torch_sync: bool = True,
         device: str = "cpu",
         use_cpp: bool = True,
+        disable_heuristic: bool = False,
     ) -> 'MFACO_TSP':
         """
         Create an MFACO_TSP instance restored from a Snapshot object.
@@ -270,6 +283,7 @@ class MFACO_TSP:
             enable_torch_sync=enable_torch_sync,
             device=device,
             use_cpp=use_cpp,
+            disable_heuristic=disable_heuristic,
         )
         
         # Load snapshot state using the load_snapshot method
@@ -536,10 +550,14 @@ class MFACO_TSP:
         """
         if self._use_cpp:
             tau = self.pheromone_sparse.clamp_min(1e-10) ** self.alpha
-            h = self.h_sparse_torch
-            if invtemp != 1.0:
-                h = h ** float(invtemp)
-            w = tau * h
+
+            if self.disable_heuristic:
+                w = tau
+            else:
+                h = self.h_sparse_torch
+                if invtemp != 1.0:
+                    h = h ** float(invtemp)
+                w = tau * h
             w = w.clamp_min(1e-12)
             
             if residual_logits is not None:

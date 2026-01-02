@@ -197,6 +197,7 @@ public:
     float p_best;           // for tau limits
     bool use_local_search;
     bool random_mode;       // uniform random selection instead of roulette
+    bool disable_heuristic; // if true, set eta=1 so sampling uses pheromone (+ residual) only
 
     // State arrays
     std::vector<float> distances;           // (n, n) row-major
@@ -235,7 +236,8 @@ public:
         float alpha = 1.0f,
         float p_best = 0.05f,
         bool use_local_search = true,
-        bool random_mode = false
+        bool random_mode = false,
+        bool disable_heuristic = false
     );
 
     // ========================================================================
